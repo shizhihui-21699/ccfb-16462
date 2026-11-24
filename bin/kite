@@ -1,0 +1,75 @@
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+require "domain_guard"
+require "domain_guard/simulated_dns"
+require "optparse"
+require "fileutils"
+
+# Thin CLI over the library, so the flows can be exercised by hand and so the
+# operator-facing behaviour (leaving things in DNS, seeing instructions) is
+# visible without a web UI.
+#
+#   bin/kite claim   --account 1 --host www.example.com
+#   bin/kite verify  --claim 12
+#   bin/kite release --claim 12
+#   bin/kite sweep
+#   bin/kite audit-verify
+module CLI
+  module_function
+
+  def run(argv)
+    db = ENV.fetch("KITE_DB", File.expand_path("../tmp/kite.sqlite3", __dir__))
+    FileUtils.mkdir_p(File.dirname(db))
+    config = DomainGuard::Config.new(
+      public_suffix_path: File.expand_path("../data/public_suffix_list.dat", __dir__)
+    )
+    # The CLI uses real DNS by default; KITE_SIMULATED=1 turns it off.
+    dns = ENV["KITE_SIMULATED"] ? DomainGuard::SimulatedDns.new : nil
+    platform = DomainGuard.boot!(config, database: db, dns: dns)
+
+    command = argv.shift
+    case command
+    when "claim"
+      account_id, host, proof = parse(argv, %w[account host proof])
+      account = DomainGuard::Account.find(account_id) || raise("unknown account")
+      result = platform.domains.claim(account: account, host: host,
+                                      proof: (proof || nil))
+      puts "claim ##{result.claim.id} #{result.claim.host} (#{result.claim.state}, proof=#{result.claim.proof})"
+      puts "  add: #{result.instructions[:cname][:name]} CNAME #{result.instructions[:cname][:value]}"
+      puts "  or:  #{result.instructions[:txt][:name]} TXT #{result.instructions[:txt][:value]}"
+      puts "  review: #{result.claim.review_required?} #{result.claim.review_reason}"
+    when "verify"
+      id, = parse(argv, %w[claim])
+      observation = platform.domains.verify!(DomainGuard::CustomDomain.find(Integer(id)))
+      puts "observation: #{observation.state} #{observation.detail}"
+    when "release"
+      id, = parse(argv, %w[claim])
+      row = platform.domains.release(DomainGuard::CustomDomain.find(Integer(id)))
+      puts "claim ##{row.id} -> #{row.state}"
+    when "sweep"
+      puts platform.scheduler.tick.inspect
+    when "audit-verify"
+      ok, bad = platform.audit.verify_chain!
+      puts ok ? "audit chain intact (#{DomainGuard::AuditEvent.count} entries)" : "chain broken at ##{bad}"
+    when "issue"
+      id, = parse(argv, %w[claim])
+      claim = DomainGuard::CustomDomain.find(Integer(id))
+      cert = platform.issuer.issue(account: DomainGuard::Account.find(claim.account_id),
+                                   claims: [claim])
+      puts "certificate ##{cert.id} serial=#{cert.serial} not_after=#{cert.not_after.utc.iso8601}"
+    when nil, "-h", "--help"
+      puts "usage: bin/kite {claim|verify|release|sweep|audit-verify|issue} [--key value ...]"
+    else
+      abort "unknown command #{command}"
+    end
+  end
+
+  def parse(argv, keys)
+    opts = {}
+    OptionParser.new do |o|
+      keys.each { |k| o.on("--#{k} VALUE") { |v| opts[k] = v } }
+    end.parse!(argv)
+    keys.map { |k| opts[k] }
+  end
+end
+
+CLI.run(ARGV.dup) if $PROGRAM_NAME == __FILE__

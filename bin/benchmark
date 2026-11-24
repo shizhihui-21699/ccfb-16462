@@ -1,0 +1,125 @@
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+require "domain_guard"
+require "domain_guard/simulated_dns"
+require "benchmark"
+require "fileutils"
+
+# Scale benchmark for the scheduler.
+#
+# The feature brief is explicit about "hundreds of thousands of custom
+# domains" and "certificates renew periodically". This script builds that
+# population on disk and measures what a single scheduler pass costs, to
+# demonstrate that a sweep is proportional to *due* rows, not to population.
+#
+#   ruby bin/benchmark          # default: 300_000 domains, 1% due
+#   DOMAINS=50000 DUE=500 ruby bin/benchmark
+module Bench
+  module_function
+
+  def run
+    domains = Integer(ENV.fetch("DOMAINS", "300000"))
+    due = Integer(ENV.fetch("DUE", "3000"))
+    db_path = File.expand_path("../tmp/bench-#{domains}.sqlite3", __dir__)
+    FileUtils.rm_f(db_path)
+    FileUtils.rm_f("#{db_path}-wal")
+    FileUtils.rm_f("#{db_path}-shm")
+
+    now = Time.utc(2026, 11, 25, 12, 0, 0)
+    clock = -> { now }
+    config = DomainGuard::Config.new(
+      clock: clock,
+      public_suffix_path: File.expand_path("../data/public_suffix_list.dat", __dir__)
+    )
+    dns = DomainGuard::SimulatedDns.new
+    DomainGuard::DB.connect!(database: db_path)
+    platform = DomainGuard::Platform.new(config: config, dns: dns)
+
+    account = DomainGuard::Account.create!(name: "bulk", now: now)
+    puts "Populating #{domains} domains (#{due} due)…"
+
+    build = Benchmark.realtime do
+      insert_bulk(platform, account, domains, now)
+    end
+    puts "  inserted in #{build.round(2)}s"
+
+    if due.positive?
+      ids = DomainGuard::CustomDomain.order(:id).limit(due).pluck(:id)
+      # Make the due ones verifiable.
+      DomainGuard::CustomDomain.where(id: ids).pluck(:host, :token_blob).each do |host, blob|
+        token = platform.domains.token_for(
+                                      DomainGuard::CustomDomain.find_by(host: host))
+        dns.set_cname(host, DomainGuard::CnameTarget.build(token: token, config: config))
+      end
+      DomainGuard::CustomDomain.where(id: ids).update_all(
+        next_check_at: (now - 60).utc.iso8601(6)
+      )
+    end
+
+    puts "Population: #{DomainGuard::CustomDomain.count}, due: #{DomainGuard::CustomDomain.due_for_check(now).count}"
+
+    %w[expirations checks sweep_delegations].each { |m| }
+    results = Benchmark.measure do
+      @sweep = platform.scheduler.sweep_checks(limit: due.positive? ? due : 1)
+    end
+    puts "sweep_checks:     #{results.real.round(3)}s for #{@sweep} rows " \
+         "(#{(results.real / [@sweep, 1].max * 1000).round(1)} ms/row)"
+
+    exp = Benchmark.measure { platform.scheduler.sweep_expirations }
+    puts "sweep_expirations:#{exp.real.round(3)}s"
+
+    # Measure index usage rather than guessing.
+    plan = ActiveRecord::Base.connection.select_all(
+      "EXPLAIN QUERY PLAN SELECT id FROM custom_domains WHERE state IN ('pending','active','at_risk') AND next_check_at <= '#{now.utc.iso8601(6)}' ORDER BY next_check_at, id LIMIT 500"
+    ).rows.map { |r| r.last }
+    puts "query plan: #{plan.join(' | ')}"
+
+    counts = ActiveRecord::Base.connection.select_all(
+      "SELECT state, COUNT(*) c FROM custom_domains GROUP BY state"
+    ).rows.to_h
+    puts "states: #{counts.inspect}"
+
+    FileUtils.rm_f(db_path)
+  end
+
+  def insert_bulk(platform, account, count, now)
+    batch = []
+    count.times do |i|
+      host = "d#{i}.bulk.example-host.com"
+      token = DomainGuard::ProofToken.generate
+      batch << {
+        account_id: account.id,
+        host: host,
+        registrable_domain: "bulk.example-host.com",
+        state: "active",
+        proof: "cname",
+        token_digest: DomainGuard::ProofToken.digest(token),
+        token_blob: platform.vault.encrypt(token, aad: "claim:#{host}:#{account.id}"),
+        verified_at: now.utc.iso8601(6),
+        last_checked_at: now.utc.iso8601(6),
+        next_check_at: (now + 86_400 + rand(3600)).utc.iso8601(6),
+        check_failures: 0,
+        risk_level: "normal",
+        review_required: 0,
+        created_at: now.utc.iso8601(6),
+        updated_at: now.utc.iso8601(6),
+        lock_version: 0
+      }
+      if batch.size >= 1000
+        flush(batch)
+        batch = []
+      end
+    end
+    flush(batch) unless batch.empty?
+  end
+
+  def flush(rows)
+    keys = rows.first.keys
+    sql = "INSERT INTO custom_domains (#{keys.join(',')}) VALUES " +
+          Array.new(rows.size, "(#{Array.new(keys.size, '?').join(',')})").join(",")
+    ActiveRecord::Base.connection.execute(
+      ActiveRecord::Base.sanitize_sql_array([sql] + rows.flat_map(&:values))
+    )
+  end
+end
+
+Bench.run if $PROGRAM_NAME == __FILE__

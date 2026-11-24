@@ -1,0 +1,111 @@
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+require "domain_guard"
+require "domain_guard/simulated_dns"
+
+# End-to-end walkthrough of the reported incident and the fix.
+#
+# Everything runs in memory, so the demo is deterministic and needs no network.
+module Demo
+  module_function
+
+  def line(title)
+    puts "\n\e[1m#{title}\e[0m"
+    puts "-" * title.length
+  end
+
+  def step(text)
+    puts "  • #{text}"
+  end
+
+  def run
+    now = Time.utc(2026, 11, 25, 9, 0, 0)
+    clock = -> { now }
+    config = DomainGuard::Config.new(
+      clock: clock,
+      public_suffix_path: File.expand_path("../data/public_suffix_list.dat", __dir__)
+    )
+    dns = DomainGuard::SimulatedDns.new
+    platform = DomainGuard.boot!(config, dns: dns)
+
+    alice = DomainGuard::Account.create!(name: "Victim Co (alice)", now: now)
+    mallory = DomainGuard::Account.create!(name: "Attacker (mallory)", now: now)
+    host = "www.victim-store.com"
+
+    line "1. Victim binds #{host} and proves ownership"
+    claim = platform.domains.claim(account: alice, host: host)
+    step "proof method: #{claim.instructions[:proof]}"
+    step "publish: #{claim.instructions[:cname][:name]} CNAME #{claim.instructions[:cname][:value]}"
+    dns.set_cname(host, claim.instructions[:cname][:value])
+    obs = platform.domains.verify!(claim.claim)
+    step "verification: #{obs.state} (via #{obs.via})"
+    step "claim state: #{DomainGuard::CustomDomain.find(claim.claim.id).state}"
+
+    line "2. Victim gets a certificate and serves the site"
+    active = DomainGuard::CustomDomain.find(claim.claim.id)
+    cert = platform.issuer.issue(account: alice, claims: [active])
+    step "issued serial #{cert.serial[0, 16]}… valid until #{cert.not_after.utc.iso8601}"
+    step "serving cert for #{host}: #{platform.issuer.serving_certificate(host)&.serial&.slice(0, 16)}…"
+
+    line "3. Victim migrates away: unbinds on this platform, but the DNS record stays"
+    platform.domains.release(active, reason: "migrated_to_other_provider")
+    step "claim state: #{DomainGuard::CustomDomain.find(active.id).state}"
+    step "DNS still has the old CNAME: #{dns.cname(host).records.first.value}"
+
+    line "4. Attacker tries the reported attack"
+    attack = platform.domains.claim(account: mallory, host: host)
+    step "attacker's claim has a fresh #{attack.instructions[:proof]} token"
+    step "DNS still answers with the victim's old target"
+    obs = platform.domains.verify!(attack.claim)
+    step "verification: #{obs.state} — #{obs.detail}"
+    step "attacker claim state: #{DomainGuard::CustomDomain.find(attack.claim.id).state}"
+
+    line "5. What the platform recorded about the reclaim"
+    row = DomainGuard::CustomDomain.find(attack.claim.id)
+    step "review required: #{row.review_required?} (#{row.review_reason})"
+    step "risk level: #{row.risk_level}"
+    note = DomainGuard::Notification.where(account_id: alice.id, kind: "host_reclaimed").first
+    step "victim notified: #{note ? "yes, dispute window until #{note.payload['dispute_by']}" : "no"}"
+
+    line "6. Attacker actually controls DNS and publishes the fresh token"
+    if attack.instructions[:proof] == "txt"
+      dns.add_txt(config.verification_fqdn(host), attack.instructions[:txt][:value])
+    else
+      dns.set_cname(host, attack.instructions[:cname][:value])
+    end
+    obs = platform.domains.verify!(attack.claim)
+    step "verification: #{obs.state} via #{obs.via}"
+    row = DomainGuard::CustomDomain.find(attack.claim.id)
+    step "claim state: #{row.state}; still flagged for review: #{row.review_required?}"
+
+    line "7. Issuance re-checks everything; state alone is not trusted"
+    begin
+      platform.issuer.issue(account: mallory, claims: [row])
+      step "issuance succeeded"
+    rescue DomainGuard::IssuanceDenied => e
+      step "issuance denied: #{e.reason} — #{e.message}"
+    end
+    step "even with real DNS control, a recent reclaim's first certificate waits for review"
+
+    line "8. Victim disputes the reclaim"
+    platform.domains.dispute(row, account: alice, message: "I never gave up this domain")
+    row = DomainGuard::CustomDomain.find(attack.claim.id)
+    step "still serving: #{row.active?}; review reason: #{row.review_reason}"
+    step "a dispute never takes an existing site down"
+
+    line "9. Moderator resolves: the reclaim was legitimate, review cleared"
+    row.update!(review_required: 0, review_reason: nil, updated_at: now)
+    cert = platform.issuer.issue(account: mallory, claims: [row])
+    step "certificate issued after review: serial #{cert.serial[0, 16]}…"
+
+    line "10. Audit chain"
+    ok, bad = platform.audit.verify_chain!
+    step "audit entries: #{DomainGuard::AuditEvent.count}, chain intact: #{ok}"
+    DomainGuard::AuditEvent.order(:id).last(7).each do |e|
+      step "#{e.created_at.utc.strftime('%H:%M:%S')}  #{e.action.ljust(22)} #{e.host}"
+    end
+
+    puts
+  end
+end
+
+Demo.run if $PROGRAM_NAME == __FILE__
